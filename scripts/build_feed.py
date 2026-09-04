@@ -20,6 +20,7 @@ SITEMAP_URL = f"{SITE_URL}/sitemap.xml"
 DEFAULT_FEED_URL = "https://jontian.github.io/shifenxiyin-rss/feed.xml"
 USER_AGENT = "shifenxiyin-rss/1.0 (+https://github.com/JonTian/shifenxiyin-rss)"
 UUID_PATH = re.compile(r"^https://shifenxiyin\.com/[0-9a-f-]{36}$")
+MIN_EXPECTED_EPISODES = 78
 
 
 class JsonLdParser(html.parser.HTMLParser):
@@ -52,6 +53,14 @@ def sitemap_urls() -> list[str]:
     root = ET.fromstring(fetch(SITEMAP_URL))
     urls = [node.text.strip() for node in root.findall("{*}url/{*}loc") if node.text]
     return [url for url in urls if UUID_PATH.match(url)]
+
+
+def existing_feed_item_count(path: Path) -> int:
+    """Return the number of existing RSS items, or zero when no valid feed exists."""
+    try:
+        return len(ET.parse(path).findall("./channel/item"))
+    except (ET.ParseError, OSError):
+        return 0
 
 
 def episode_from_page(url: str) -> dict[str, str]:
@@ -138,8 +147,19 @@ def build_feed(episodes: list[dict[str, str]], output: Path) -> None:
 
 def main() -> int:
     urls = sitemap_urls()
-    if not urls:
-        print("No episode URLs found", file=sys.stderr)
+    output = Path(os.environ.get("OUTPUT", "public/feed.xml"))
+    existing_count = existing_feed_item_count(output)
+    if len(urls) < MIN_EXPECTED_EPISODES:
+        if existing_count >= MIN_EXPECTED_EPISODES:
+            print(
+                f"Source currently exposes {len(urls)} episode(s); "
+                f"retaining the existing {existing_count}-episode feed."
+            )
+            return 0
+        print(
+            f"Source exposes only {len(urls)} episode(s), and no complete existing feed is available.",
+            file=sys.stderr,
+        )
         return 1
     episodes: list[dict[str, str]] = []
     failures: list[str] = []
@@ -154,7 +174,6 @@ def main() -> int:
     if failures:
         print("\n".join(failures), file=sys.stderr)
         return 1
-    output = Path(os.environ.get("OUTPUT", "public/feed.xml"))
     output.parent.mkdir(parents=True, exist_ok=True)
     build_feed(episodes, output)
     print(f"Generated {output} with {len(episodes)} episodes")
