@@ -17,6 +17,7 @@ from pathlib import Path
 
 SITE_URL = "https://shifenxiyin.com"
 SITEMAP_URL = f"{SITE_URL}/sitemap.xml"
+OFFICIAL_FEED_URL = "https://feed.xyzfm.space/nc63kbv63kjh"
 DEFAULT_FEED_URL = "https://jontian.github.io/shifenxiyin-rss/feed.xml"
 USER_AGENT = "shifenxiyin-rss/1.0 (+https://github.com/JonTian/shifenxiyin-rss)"
 UUID_PATH = re.compile(r"^https://shifenxiyin\.com/[0-9a-f-]{36}$")
@@ -49,6 +50,12 @@ def fetch(url: str) -> bytes:
         return response.read()
 
 
+def fetch_official_feed() -> bytes:
+    """The publisher feed rejects the crawler user agent used for transcript pages."""
+    with urllib.request.urlopen(OFFICIAL_FEED_URL, timeout=45) as response:
+        return response.read()
+
+
 def sitemap_urls() -> list[str]:
     root = ET.fromstring(fetch(SITEMAP_URL))
     urls = [node.text.strip() for node in root.findall("{*}url/{*}loc") if node.text]
@@ -71,10 +78,13 @@ def episodes_from_existing_feed(path: Path) -> list[dict[str, str]]:
         return []
 
     itunes = "{http://www.itunes.com/dtds/podcast-1.0.dtd}"
+    content = "{http://purl.org/rss/1.0/modules/content/}"
+    podcast = "{https://podcastindex.org/namespace/1.0}"
     episodes: list[dict[str, str]] = []
     for item in root.findall("./channel/item"):
         enclosure = item.find("enclosure")
         image = item.find(f"{itunes}image")
+        transcript = item.find(f"{podcast}transcript")
         url = item.findtext("guid") or item.findtext("link") or ""
         published = item.findtext("pubDate") or ""
         if not url or enclosure is None or not enclosure.get("url") or not published:
@@ -88,10 +98,12 @@ def episodes_from_existing_feed(path: Path) -> list[dict[str, str]]:
                 "url": url,
                 "title": item.findtext("title") or "",
                 "description": item.findtext("description") or "",
+                "content": item.findtext(f"{content}encoded") or item.findtext("description") or "",
                 "published": published,
                 "duration": item.findtext(f"{itunes}duration") or "",
                 "image": image.get("href", "") if image is not None else "",
                 "audio": enclosure.get("url", ""),
+                "transcript": transcript.get("url", "") if transcript is not None else "",
             }
         )
     return episodes
@@ -114,11 +126,30 @@ def episode_from_page(url: str) -> dict[str, str]:
         "url": episode["url"],
         "title": episode["name"],
         "description": episode.get("description", ""),
+        "content": episode.get("description", ""),
         "published": episode["datePublished"],
         "duration": episode.get("duration", ""),
         "image": episode.get("image", ""),
         "audio": media["contentUrl"],
+        "transcript": f'{episode["url"]}.md',
     }
+
+
+def official_episode_metadata() -> dict[str, dict[str, str]]:
+    """Get publisher-authored descriptions for episodes still present in its RSS."""
+    root = ET.fromstring(fetch_official_feed())
+    content = "{http://purl.org/rss/1.0/modules/content/}"
+    metadata: dict[str, dict[str, str]] = {}
+    for item in root.findall("./channel/item"):
+        title = item.findtext("title") or ""
+        if title:
+            # The publisher GUID is its platform episode ID, while the archive
+            # uses transcript-page URLs, so title is the stable cross-feed key.
+            metadata[title] = {
+                "description": item.findtext("description") or "",
+                "content": item.findtext(f"{content}encoded") or item.findtext("description") or "",
+            }
+    return metadata
 
 
 def rfc2822(value: str) -> str:
@@ -146,6 +177,7 @@ def build_feed(episodes: list[dict[str, str]], output: Path) -> None:
     ET.register_namespace("atom", "http://www.w3.org/2005/Atom")
     ET.register_namespace("itunes", "http://www.itunes.com/dtds/podcast-1.0.dtd")
     ET.register_namespace("content", "http://purl.org/rss/1.0/modules/content/")
+    ET.register_namespace("podcast", "https://podcastindex.org/namespace/1.0")
     root = ET.Element("rss", {"version": "2.0"})
     channel = add(root, "channel")
     feed_url = os.environ.get("FEED_URL", DEFAULT_FEED_URL)
@@ -168,12 +200,19 @@ def build_feed(episodes: list[dict[str, str]], output: Path) -> None:
         add(item, "guid", episode["url"], isPermaLink="true")
         add(item, "pubDate", rfc2822(episode["published"]))
         add(item, "description", episode["description"])
-        add(item, "{http://purl.org/rss/1.0/modules/content/}encoded", episode["description"])
+        add(item, "{http://purl.org/rss/1.0/modules/content/}encoded", episode.get("content", episode["description"]))
         add(item, "enclosure", url=episode["audio"], type="audio/mp4", length="0")
         add(item, "{http://www.itunes.com/dtds/podcast-1.0.dtd}duration", itunes_duration(episode["duration"]))
         add(item, "{http://www.itunes.com/dtds/podcast-1.0.dtd}explicit", "false")
         if episode["image"]:
             add(item, "{http://www.itunes.com/dtds/podcast-1.0.dtd}image", href=episode["image"])
+        if episode.get("transcript"):
+            add(
+                item,
+                "{https://podcastindex.org/namespace/1.0}transcript",
+                url=episode["transcript"],
+                type="text/markdown",
+            )
 
     ET.indent(root, space="  ")
     output.write_bytes(b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" + ET.tostring(root, encoding="utf-8"))
@@ -202,6 +241,17 @@ def main() -> int:
     if failures:
         print("\n".join(failures), file=sys.stderr)
         return 1
+
+    try:
+        publisher_metadata = official_episode_metadata()
+    except Exception as exc:
+        print(f"Could not read publisher feed; retaining page summaries: {exc}", file=sys.stderr)
+        publisher_metadata = {}
+    for episode in episodes:
+        publisher = publisher_metadata.get(episode["title"])
+        if publisher:
+            episode["description"] = publisher["description"] or episode["description"]
+            episode["content"] = publisher["content"] or episode["content"]
 
     # The source currently lists only recent episodes.  Refresh those entries while
     # retaining every archived item already in the published feed.
