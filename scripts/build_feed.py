@@ -63,6 +63,40 @@ def existing_feed_item_count(path: Path) -> int:
         return 0
 
 
+def episodes_from_existing_feed(path: Path) -> list[dict[str, str]]:
+    """Read previously published items so a truncated source cannot erase history."""
+    try:
+        root = ET.parse(path).getroot()
+    except (ET.ParseError, OSError):
+        return []
+
+    itunes = "{http://www.itunes.com/dtds/podcast-1.0.dtd}"
+    episodes: list[dict[str, str]] = []
+    for item in root.findall("./channel/item"):
+        enclosure = item.find("enclosure")
+        image = item.find(f"{itunes}image")
+        url = item.findtext("guid") or item.findtext("link") or ""
+        published = item.findtext("pubDate") or ""
+        if not url or enclosure is None or not enclosure.get("url") or not published:
+            continue
+        try:
+            published = email.utils.parsedate_to_datetime(published).isoformat()
+        except (TypeError, ValueError):
+            continue
+        episodes.append(
+            {
+                "url": url,
+                "title": item.findtext("title") or "",
+                "description": item.findtext("description") or "",
+                "published": published,
+                "duration": item.findtext(f"{itunes}duration") or "",
+                "image": image.get("href", "") if image is not None else "",
+                "audio": enclosure.get("url", ""),
+            }
+        )
+    return episodes
+
+
 def episode_from_page(url: str) -> dict[str, str]:
     parser = JsonLdParser()
     parser.feed(fetch(url).decode("utf-8"))
@@ -148,14 +182,8 @@ def build_feed(episodes: list[dict[str, str]], output: Path) -> None:
 def main() -> int:
     urls = sitemap_urls()
     output = Path(os.environ.get("OUTPUT", "public/feed.xml"))
-    existing_count = existing_feed_item_count(output)
-    if len(urls) < MIN_EXPECTED_EPISODES:
-        if existing_count >= MIN_EXPECTED_EPISODES:
-            print(
-                f"Source currently exposes {len(urls)} episode(s); "
-                f"retaining the existing {existing_count}-episode feed."
-            )
-            return 0
+    existing = episodes_from_existing_feed(output)
+    if len(urls) < MIN_EXPECTED_EPISODES and len(existing) < MIN_EXPECTED_EPISODES:
         print(
             f"Source exposes only {len(urls)} episode(s), and no complete existing feed is available.",
             file=sys.stderr,
@@ -174,9 +202,20 @@ def main() -> int:
     if failures:
         print("\n".join(failures), file=sys.stderr)
         return 1
+
+    # The source currently lists only recent episodes.  Refresh those entries while
+    # retaining every archived item already in the published feed.
+    merged = {episode["url"]: episode for episode in existing}
+    merged.update({episode["url"]: episode for episode in episodes})
+    if len(merged) < max(MIN_EXPECTED_EPISODES, len(existing)):
+        print("Merged feed would lose archived episodes; refusing to publish.", file=sys.stderr)
+        return 1
     output.parent.mkdir(parents=True, exist_ok=True)
-    build_feed(episodes, output)
-    print(f"Generated {output} with {len(episodes)} episodes")
+    build_feed(list(merged.values()), output)
+    print(
+        f"Generated {output} with {len(merged)} episodes "
+        f"({len(episodes)} refreshed from source, {len(existing)} retained)."
+    )
     return 0
 
 
