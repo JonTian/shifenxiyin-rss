@@ -135,17 +135,22 @@ def episode_from_page(url: str) -> dict[str, str]:
     }
 
 
+def episode_key(audio: str) -> str:
+    """Identify the platform episode independently of editorial title changes."""
+    match = re.search(r"/track/[0-9a-f]{24}/([0-9a-f]{24})/", audio)
+    return match.group(1) if match else audio.split("?", 1)[0]
+
+
 def official_episode_metadata() -> dict[str, dict[str, str]]:
     """Get publisher-authored descriptions for episodes still present in its RSS."""
     root = ET.fromstring(fetch_official_feed())
     content = "{http://purl.org/rss/1.0/modules/content/}"
     metadata: dict[str, dict[str, str]] = {}
     for item in root.findall("./channel/item"):
-        title = item.findtext("title") or ""
-        if title:
-            # The publisher GUID is its platform episode ID, while the archive
-            # uses transcript-page URLs, so title is the stable cross-feed key.
-            metadata[title] = {
+        enclosure = item.find("enclosure")
+        audio = enclosure.get("url", "") if enclosure is not None else ""
+        if audio:
+            metadata[episode_key(audio)] = {
                 "description": item.findtext("description") or "",
                 "content": item.findtext(f"{content}encoded") or item.findtext("description") or "",
             }
@@ -247,11 +252,23 @@ def main() -> int:
     except Exception as exc:
         print(f"Could not read publisher feed; retaining page summaries: {exc}", file=sys.stderr)
         publisher_metadata = {}
+    archived = {episode["url"]: episode for episode in existing}
+    matched = 0
     for episode in episodes:
-        publisher = publisher_metadata.get(episode["title"])
+        publisher = publisher_metadata.get(episode_key(episode["audio"]))
         if publisher:
+            matched += 1
             episode["description"] = publisher["description"] or episode["description"]
             episode["content"] = publisher["content"] or episode["content"]
+        else:
+            # Do not replace detailed archived notes with a short page summary
+            # when the publisher is unavailable or has removed an older item.
+            previous = archived.get(episode["url"], {})
+            for field in ("description", "content"):
+                if len(previous.get(field, "")) > len(episode.get(field, "")):
+                    episode[field] = previous[field]
+            print(f"Publisher notes unavailable for {episode['title']}; preserving available notes.")
+    print(f"Matched publisher notes for {matched}/{len(episodes)} current episodes by audio ID.")
 
     # The source currently lists only recent episodes.  Refresh those entries while
     # retaining every archived item already in the published feed.
