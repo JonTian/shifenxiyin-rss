@@ -8,6 +8,7 @@ on:
     branches: [main]
 
 permissions:
+  actions: read
   contents: write
   pages: write
   id-token: write
@@ -42,9 +43,34 @@ jobs:
           git push
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
+        id: upload
         with:
           path: public
           name: github-pages-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Wait for Pages artifact to be listed
+        timeout-minutes: 2
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PAGES_ARTIFACT_NAME: github-pages-${{ github.run_id }}-${{ github.run_attempt }}
+          PAGES_ARTIFACT_ID: ${{ steps.upload.outputs.artifact_id }}
+        run: |
+          if [[ ! "$PAGES_ARTIFACT_ID" =~ ^[0-9]+$ ]]; then
+            echo "::error::Upload did not return a valid Pages artifact ID"
+            exit 1
+          fi
+          for attempt in {1..8}; do
+            if gh api --method GET "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts" \
+              -f name="$PAGES_ARTIFACT_NAME" -f per_page=100 |
+              jq -e --arg id "$PAGES_ARTIFACT_ID" --arg name "$PAGES_ARTIFACT_NAME" \
+                'any(.artifacts[]; (.id | tostring) == $id and .name == $name and .expired == false)' >/dev/null; then
+              echo "Pages artifact $PAGES_ARTIFACT_ID is visible."
+              exit 0
+            fi
+            echo "Waiting for Pages artifact to be listed ($attempt/8)"
+            if [[ "$attempt" != 8 ]]; then sleep 5; fi
+          done
+          echo "::error::Pages artifact $PAGES_ARTIFACT_ID did not become visible"
+          exit 1
       - name: Deploy GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
